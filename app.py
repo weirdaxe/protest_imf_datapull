@@ -1,127 +1,194 @@
-# app.py
+import io
 import streamlit as st
 import pandas as pd
-import requests
-from io import BytesIO
 
 from macro_data_api import (
     build_country_table,
     fetch_imf_series,
     wb_fetch_indicator,
-    IMF_BASE_URL,
-    imf_compact_to_df,
-)
-
-st.title("Macro Data Downloader")
-
-mode = st.radio(
-    "Mode",
-    ("Full macro data pull", "IMF API connectivity test"),
-)
-
-st.write(
-    "Use the test mode to verify IMF API connectivity and inspect raw output. "
-    "Once that works, run the full macro data pull."
+    imf_compact_quick_test,
+    sdmxcentral_agencyscheme_test,
 )
 
 
-def run_imf_test():
-    """
-    Barebones IMF call for debugging:
-    - IFS dataset
-    - Monthly USD FX rate (ENDA_XDC_USD_RATE)
-    - Netherlands (NL)
-    - 2015-01 to 2018-12
-    Shows raw response text + parsed DataFrame head.
-    """
-    st.subheader("IMF API connectivity test")
+def main():
+    st.title("Macro data pull shell (IMF + World Bank)")
 
-    base = IMF_BASE_URL.rstrip("/")
-    url = (
-        f"{base}/CompactData/IFS/M.NL.ENDA_XDC_USD_RATE"
-        "?startPeriod=2015-01&endPeriod=2018-12"
+    # ---- Sidebar options ----
+    st.sidebar.header("Run options")
+
+    test_subset = st.sidebar.checkbox(
+        "Use small country subset (test mode)", value=True
+    )
+    show_raw_imf = st.sidebar.checkbox(
+        "Show raw IMF JSON for main pull", value=False
     )
 
-    st.markdown("**Request URL**")
-    st.code(url, language="text")
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("IMF connectivity / debug")
 
-    try:
-        resp = requests.get(url, timeout=10)
-    except Exception as e:
-        st.error(f"Request error: {e}")
+    run_imf_small_test = st.sidebar.checkbox(
+        "Run tiny IMF CPI test first", value=True
+    )
+    run_sdmxcentral_test = st.sidebar.checkbox(
+        "Run IMF SDMX Central structure test", value=True
+    )
+
+    st.sidebar.markdown("---")
+    filename = st.sidebar.text_input(
+        "Output Excel filename",
+        value="macro_panel.xlsx",
+    )
+
+    run_button = st.button("Run tests and pull data")
+
+    if not run_button:
         return
 
-    st.markdown("**HTTP status**")
-    st.write(resp.status_code)
+    # ---- Connectivity / debug tests ----
+    if run_sdmxcentral_test:
+        st.subheader("SDMX Central connectivity test")
+        with st.spinner("Calling IMF SDMX Central..."):
+            try:
+                xml = sdmxcentral_agencyscheme_test()
+                st.success("SDMX Central call succeeded.")
+                st.write("First 2000 characters of response:")
+                st.code(xml[:2000])
+            except Exception as exc:
+                st.error(f"SDMX Central test failed: {exc}")
 
-    st.markdown("**Content-Type**")
-    st.write(resp.headers.get("content-type"))
-
-    st.markdown("**Final URL (after redirects, if any)**")
-    st.code(resp.url, language="text")
-
-    st.markdown("**First 1000 characters of raw response body**")
-    st.code(resp.text[:1000], language="text")
-
-    # Try parsing JSON and converting to DataFrame
-    if resp.ok and "json" in (resp.headers.get("content-type") or "").lower():
-        try:
-            json_obj = resp.json()
-            df_test = imf_compact_to_df(json_obj)
-            if not df_test.empty:
-                st.markdown("**Parsed DataFrame (head)**")
+    if run_imf_small_test:
+        st.subheader("IMF CompactData tiny CPI test (dataservices.imf.org)")
+        with st.spinner("Calling IMF CompactData for a tiny CPI slice..."):
+            try:
+                # reuse the quick test, but capture printed output by re-running
+                # through fetch_imf_series directly so we can show raw JSON
+                df_test, raw = fetch_imf_series(
+                    dataset="CPI",
+                    freq="M",
+                    indicator="PCPI_IX",
+                    countries_iso2=["MX"],
+                    start_period="2020-01",
+                    end_period="2021-12",
+                    return_raw_json=True,
+                )
+                st.success(
+                    f"IMF tiny CPI test succeeded: {len(df_test)} rows."
+                )
+                st.write("Parsed head:")
                 st.dataframe(df_test.head())
-            else:
-                st.warning("Parsed JSON but got an empty DataFrame.")
-        except Exception as e:
-            st.warning(f"Failed to parse JSON into DataFrame: {e}")
-    else:
-        st.warning("Response is not JSON, or status is not OK.")
+                st.write("Raw IMF JSON (first 2000 chars):")
+                st.code(raw[:2000])
+            except Exception as exc:
+                st.error(f"IMF tiny CPI test failed: {exc}")
 
+    st.markdown("---")
+    st.subheader("Main macro data pull")
 
-if mode == "IMF API connectivity test":
-    if st.button("Run IMF API connectivity test"):
-        run_imf_test()
+    progress = st.progress(0)
+    status = st.empty()
 
-else:
-    if st.button("Fetch and export data"):
-        progress = st.progress(0)
-        status_text = st.empty()
+    # ---- Countries ----
+    status.text("Building country table...")
+    countries = build_country_table()
+    countries = countries[countries["iso2"].notna() & countries["iso3"].notna()]
 
-        try:
-            # 1) Country lookup
-            status_text.text("Building country table...")
-            countries = build_country_table()
-            iso2 = countries["iso2"].dropna().tolist()
-            iso3 = countries["iso3"].dropna().tolist()
-            progress.progress(10)
+    if test_subset:
+        # Small EM sample for quick test runs
+        sample_iso2 = ["AR", "BR", "ZA"]
+        mask = countries["iso2"].isin(sample_iso2)
+        countries = countries[mask]
 
-            # 2) IMF: CPI (monthly)
-            status_text.text("Fetching IMF CPI (monthly)...")
+    iso2 = countries["iso2"].tolist()
+    iso3 = countries["iso3"].tolist()
+
+    if not iso2 or not iso3:
+        st.error("No valid ISO country codes after filtering.")
+        return
+
+    n_steps = 8  # 3 IMF + 5 WB
+    step = 0
+
+    # ---- IMF: CPI ----
+    step += 1
+    status.text("Fetching IMF CPI (monthly index)...")
+    try:
+        if show_raw_imf:
+            df_cpi, raw_cpi = fetch_imf_series(
+                dataset="CPI",
+                freq="M",
+                indicator="PCPI_IX",
+                countries_iso2=iso2,
+                start_period="1990-01",
+                end_period="2025-12",
+                return_raw_json=True,
+            )
+            st.expander("IMF CPI raw JSON (first 2000 chars)").code(
+                raw_cpi[:2000]
+            )
+        else:
             df_cpi = fetch_imf_series(
                 dataset="CPI",
                 freq="M",
-                indicator="PCPI_IX",  # headline CPI index
+                indicator="PCPI_IX",
                 countries_iso2=iso2,
                 start_period="1990-01",
                 end_period="2025-12",
             )
-            progress.progress(25)
+    except Exception as exc:
+        st.error(f"IMF CPI pull failed: {exc}")
+        return
+    progress.progress(step / n_steps)
 
-            # 3) IMF: FX (monthly)
-            status_text.text("Fetching IMF FX (monthly)...")
+    # ---- IMF: FX ----
+    step += 1
+    status.text("Fetching IMF FX (monthly USD rate)...")
+    try:
+        if show_raw_imf:
+            df_fx, raw_fx = fetch_imf_series(
+                dataset="ER",
+                freq="M",
+                indicator="ENDA_XDC_USD_RATE",
+                countries_iso2=iso2,
+                start_period="1990-01",
+                end_period="2025-12",
+                return_raw_json=True,
+            )
+            st.expander("IMF FX raw JSON (first 2000 chars)").code(
+                raw_fx[:2000]
+            )
+        else:
             df_fx = fetch_imf_series(
                 dataset="ER",
                 freq="M",
-                indicator="ENDA_XDC_USD_RATE",  # USD exchange rate (example code)
+                indicator="ENDA_XDC_USD_RATE",
                 countries_iso2=iso2,
                 start_period="1990-01",
                 end_period="2025-12",
             )
-            progress.progress(40)
+    except Exception as exc:
+        st.error(f"IMF FX pull failed: {exc}")
+        return
+    progress.progress(step / n_steps)
 
-            # 4) IMF: real GDP (quarterly)
-            status_text.text("Fetching IMF real GDP (quarterly)...")
+    # ---- IMF: quarterly real GDP ----
+    step += 1
+    status.text("Fetching IMF real GDP (quarterly)...")
+    try:
+        if show_raw_imf:
+            df_qgdp, raw_qgdp = fetch_imf_series(
+                dataset="IFS",
+                freq="Q",
+                indicator="NGDP_R_SA_XDC",
+                countries_iso2=iso2,
+                start_period="1990",
+                end_period="2025",
+                return_raw_json=True,
+            )
+            st.expander("IMF real GDP raw JSON (first 2000 chars)").code(
+                raw_qgdp[:2000]
+            )
+        else:
             df_qgdp = fetch_imf_series(
                 dataset="IFS",
                 freq="Q",
@@ -130,91 +197,111 @@ else:
                 start_period="1990",
                 end_period="2025",
             )
-            progress.progress(55)
+    except Exception as exc:
+        st.error(f"IMF real GDP pull failed: {exc}")
+        return
+    progress.progress(step / n_steps)
 
-            # 5) World Bank: GDP growth
-            status_text.text("Fetching World Bank GDP growth (annual)...")
-            df_gdp_g = wb_fetch_indicator(
-                indicator="NY.GDP.MKTP.KD.ZG",
-                iso3_list=iso3,
-                start_year=1990,
-                end_year=2025,
-            )
-            progress.progress(65)
+    # ---- World Bank indicators ----
+    # GDP growth
+    step += 1
+    status.text("Fetching WB GDP growth...")
+    try:
+        df_gdp_g = wb_fetch_indicator(
+            indicator="NY.GDP.MKTP.KD.ZG",
+            iso3_list=iso3,
+            start_year=1990,
+            end_year=2025,
+        )
+    except Exception as exc:
+        st.error(f"WB GDP growth pull failed: {exc}")
+        return
+    progress.progress(step / n_steps)
 
-            # 6) World Bank: current account
-            status_text.text("Fetching World Bank current account (annual)...")
-            df_ca = wb_fetch_indicator(
-                indicator="BN.CAB.XOKA.GD.ZS",
-                iso3_list=iso3,
-                start_year=1990,
-                end_year=2025,
-            )
-            progress.progress(72)
+    # Current account
+    step += 1
+    status.text("Fetching WB current account (% of GDP)...")
+    try:
+        df_ca = wb_fetch_indicator(
+            indicator="BN.CAB.XOKA.GD.ZS",
+            iso3_list=iso3,
+            start_year=1990,
+            end_year=2025,
+        )
+    except Exception as exc:
+        st.error(f"WB CA pull failed: {exc}")
+        return
+    progress.progress(step / n_steps)
 
-            # 7) World Bank: FDI
-            status_text.text("Fetching World Bank FDI net inflows (annual)...")
-            df_fdi = wb_fetch_indicator(
-                indicator="BX.KLT.DINV.WD.GD.ZS",
-                iso3_list=iso3,
-                start_year=1990,
-                end_year=2025,
-            )
-            progress.progress(79)
+    # FDI
+    step += 1
+    status.text("Fetching WB FDI (% of GDP)...")
+    try:
+        df_fdi = wb_fetch_indicator(
+            indicator="BX.KLT.DINV.WD.GD.ZS",
+            iso3_list=iso3,
+            start_year=1990,
+            end_year=2025,
+        )
+    except Exception as exc:
+        st.error(f"WB FDI pull failed: {exc}")
+        return
+    progress.progress(step / n_steps)
 
-            # 8) World Bank: reserves
-            status_text.text("Fetching World Bank reserves (annual)...")
-            df_reserves = wb_fetch_indicator(
-                indicator="FI.RES.TOTL.MO",
-                iso3_list=iso3,
-                start_year=1990,
-                end_year=2025,
-            )
-            progress.progress(86)
+    # Reserves
+    step += 1
+    status.text("Fetching WB reserves (months of imports)...")
+    try:
+        df_reserves = wb_fetch_indicator(
+            indicator="FI.RES.TOTL.MO",
+            iso3_list=iso3,
+            start_year=1990,
+            end_year=2025,
+        )
+    except Exception as exc:
+        st.error(f"WB reserves pull failed: {exc}")
+        return
+    progress.progress(step / n_steps)
 
-            # 9) World Bank: government debt
-            status_text.text("Fetching World Bank government debt (annual)...")
-            df_debt = wb_fetch_indicator(
-                indicator="GC.DOD.TOTL.GD.ZS",
-                iso3_list=iso3,
-                start_year=1990,
-                end_year=2025,
-            )
-            progress.progress(93)
+    # Debt
+    step += 1
+    status.text("Fetching WB gov. debt (% of GDP)...")
+    try:
+        df_debt = wb_fetch_indicator(
+            indicator="GC.DOD.TOTL.GD.ZS",
+            iso3_list=iso3,
+            start_year=1990,
+            end_year=2025,
+        )
+    except Exception as exc:
+        st.error(f"WB debt pull failed: {exc}")
+        return
+    progress.progress(step / n_steps)
 
-            # 10) Write everything to a single Excel workbook in memory
-            status_text.text("Writing data to Excel workbook...")
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-                countries.to_excel(writer, sheet_name="countries", index=False)
-                df_cpi.to_excel(writer, sheet_name="cpi", index=False)
-                df_fx.to_excel(writer, sheet_name="fx", index=False)
-                df_qgdp.to_excel(writer, sheet_name="qgdp", index=False)
-                df_gdp_g.to_excel(writer, sheet_name="gdp_growth", index=False)
-                df_ca.to_excel(writer, sheet_name="current_account", index=False)
-                df_fdi.to_excel(writer, sheet_name="fdi", index=False)
-                df_reserves.to_excel(writer, sheet_name="reserves", index=False)
-                df_debt.to_excel(writer, sheet_name="debt", index=False)
+    status.text("Assembling Excel file...")
 
-            output.seek(0)
-            progress.progress(100)
+    # ---- Build Excel in memory ----
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_cpi.to_excel(writer, sheet_name="IMF_CPI", index=False)
+        df_fx.to_excel(writer, sheet_name="IMF_FX", index=False)
+        df_qgdp.to_excel(writer, sheet_name="IMF_QGDP", index=False)
+        df_gdp_g.to_excel(writer, sheet_name="WB_GDP_G", index=False)
+        df_ca.to_excel(writer, sheet_name="WB_CA", index=False)
+        df_fdi.to_excel(writer, sheet_name="WB_FDI", index=False)
+        df_reserves.to_excel(writer, sheet_name="WB_RESERVES", index=False)
+        df_debt.to_excel(writer, sheet_name="WB_DEBT", index=False)
 
-            status_text.text("Done.")
-            st.success("Data pull complete.")
-            st.download_button(
-                label="Download macro_data_panel.xlsx",
-                data=output,
-                file_name="macro_data_panel.xlsx",
-                mime=(
-                    "application/vnd.openxmlformats-officedocument."
-                    "spreadsheetml.sheet"
-                ),
-            )
+    output.seek(0)
 
-            st.subheader("CPI sample (first 10 rows)")
-            st.dataframe(df_cpi.head(10))
+    st.success("Done. Download your Excel file below.")
+    st.download_button(
+        label="Download Excel file",
+        data=output,
+        file_name=filename or "macro_panel.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
-        except Exception as e:
-            status_text.text("Error during data fetch.")
-            progress.progress(0)
-            st.error(f"Error: {e}")
+
+if __name__ == "__main__":
+    main()
